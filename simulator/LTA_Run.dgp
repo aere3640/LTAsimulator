@@ -1,0 +1,209 @@
+import os
+import os.path
+import threading
+import numpy as np
+import time 
+import sys
+
+import spatialnde2 as snde
+from dataguzzler_python import dgpy
+from dataguzzler_python.dgpy import InitFreeThread,sleep
+import joystick_dgp 
+import LTA_Classes as LTA
+from LTA_plotting import update_channels, update_pose_channel, setup_camera, dynamic_plotting
+
+# -----------------------------------------------------------
+# Initialization:
+# -----------------------------------------------------------
+sys.setswitchinterval(1e-4)
+# Create a dictionary of the configuration variables for analysis:
+config_file_path = os.path.join(os.path.split(__file__)[0], "LTA_config.py")
+config_variables = {}
+
+with open(config_file_path) as f:
+    code = compile(f.read(),config_file_path,'exec')
+    exec(code,config_variables)
+    pass
+
+for key in config_variables:
+    globals()[key] = config_variables[key]
+    pass
+
+# This is how everything is intialized, then we start a thread to do the dynamic model, then a second thread to 
+# run the microcontroller code.
+
+# For spatialnde2 viewer:
+orient_dtype = [('quat', '<f4', (4,)),('offset', '<f4', (4,))]
+null_orient = np.array(((1,0,0,0),(0,0,0,1)),dtype=orient_dtype)
+
+craft_model_file = "models/craftCAD_meshed.x3d"
+craft_model_shape_index = 0
+balloon_model_file = "models/balloonCAD_Meshed.x3d"
+balloon_model_shape_index = 0
+craft_model_tree = "/graphics/craft/"
+balloon_model_tree = "/graphics/balloon/"
+atrium_model_assembly = "/atrium_model_assembly"
+craft_model_camera_tree = "/graphics/camera/"
+craft_model_camera_shape_index = 0
+atrium_model_file = "models/howeatriumsolid_V5.x3d"
+atrium_model_shape_index = 0
+atrium_model_tree = "/graphics/atrium/"
+
+location = "basement"
+
+include(dgpy,"dgpy_startup.dpi") # If you get a NameError here, be sure you are executing this file with dataguzzler-python
+include(dgpy,"Qt.dpi",prefer_pyqt=False)
+include(dgpy,"matplotlib.dpi")
+
+include(snde,"recdb.dpi",enable_opencl=True) 
+include(snde,"recdb_gui.dpi")
+
+module_name = "joystick_module"
+joystick_guid = None #"0300d2e46a0e00001140000001000000" # Can add wanted GUID here    
+joystick_module = joystick_dgp.joystick_dgp_module(module_name,recdb,joystick_guid)
+
+dgpython_release_main_thread() # allow qt main loop to execute in parallel with subsequent initialization.
+plt.ion()
+
+graphman = snde.graphics_storage_manager("/graphics/",recdb.lowlevel_alloc,recdb.alignment_requirements,recdb.lockmgr,1e-8,2000000000)
+with recdb.start_transaction() as trans:
+    graphicsgroup = recdb.define_channel(trans,"/graphics/","main",False,graphman)
+    craft_recording = snde.x3d_load_geometry(trans,graphman,craft_model_file,craft_model_shape_index,"main",craft_model_tree,None,[ "reindex_vertices","reindex_tex_vertices"])
+    balloon_recording = snde.x3d_load_geometry(trans,graphman,balloon_model_file,balloon_model_shape_index,"main",balloon_model_tree,None,["reindex_vertices","reindex_tex_vertices"])
+    camera_recording = snde.x3d_load_geometry(trans,graphman,craft_model_file,craft_model_camera_shape_index,"main",craft_model_camera_tree,None,[ "reindex_vertices","reindex_tex_vertices"])
+    world_over_craft = recdb.define_channel(trans,"/world_over_craft","main")
+    world_over_balloon = recdb.define_channel(trans,"/world_over_balloon","main")
+    atrium = recdb.define_channel(trans,"/atrium","main")
+    atrium_recording = snde.x3d_load_geometry(trans,graphman,atrium_model_file,atrium_model_shape_index,"main",atrium_model_tree,None,["reindex_vertices","reindex_tex_vertices"])
+
+    atrium_model_assembly_channel = recdb.define_channel(trans,atrium_model_assembly,"main",False)
+    snde.create_assembly_recording(trans,atrium_model_assembly_channel,
+                                       snde.VectorOfStringOrientationPairs([("/world_over_craft",snde.snde_orientation3(null_orient)),
+                                                                             ("/world_over_balloon",snde.snde_orientation3(null_orient)),
+                                                                              ("/graphics/atrium/meshed",snde.snde_orientation3(null_orient))
+                                                                                                                                           ])).mark_data_and_metadata_ready()
+    update_channels(trans,world_over_craft,world_over_balloon,craft_model_tree,balloon_model_tree,atrium_model_assembly,atrium_model_assembly_channel)
+    pass
+trans.globalrev_wait()
+main_viewer.viewer.EnableChannel("/atrium_model_assembly")  
+main_viewer.viewer.set_selected("/atrium_model_assembly")  
+
+setup_camera(main_viewer,"/atrium_model_assembly",location)
+
+# -----------------------------------------------------------------------------------------
+# Threading Code
+# -----------------------------------------------------------------------------------------
+# To run the simulator with a set time step (dt) the user must set the dt value and uncomment the line with the fixed dt value.
+plot_history_now = []
+def update_threading_code(craft, balloon, strings, thrusters, recdb): 
+    
+    start_time = time.time()    
+    last_time_step = start_time
+    
+    balloon_positions = []
+    craft_positions = []
+    balloon_velocities =[]
+    craft_velocities = []
+    balloon_momentums = []
+    craft_momentums = []
+    change_in_momentum = []
+    balloon_ang_momentums = []
+    craft_ang_momentums = []
+    change_in_ang_momentums = []
+    time_steps = []
+    
+    InitFreeThread()
+    while True and len(plot_history_now) == 0:
+        # Calculate how much time has passed since the last update
+        # slowdown_factor = 10
+        slowdown_factor = 1
+        current_time = time.time()
+        elapsed_time = (current_time - last_time_step)/slowdown_factor
+        t = (current_time - start_time)/slowdown_factor
+        time_steps.append(t)
+        
+        control_values = recdb.latest.ref["/joystick"].data
+        
+        # Transform the data from -1 to 1 into 1 to 2 ms        
+        control_values_transformed = (((control_values[:3] - (-1.0))*1)/2) + 1.0
+        # control_values_transformed = np.array([1.5,1.5,1.0])
+        steps = 100000
+        num_steps = np.arange(steps)
+        dt_fixed = 0.0001
+        if elapsed_time >= dt_fixed: 
+        # for num_steps in range(steps):  # run for 100 steps
+            # (F_balloon_world, F_craft_world,moment_balloon, moment_craft) = LTA.update(craft, balloon, dt_fixed, t, strings, thrusters, control_values_transformed) 
+            # print(f'{(F_craft_world + F_balloon_world)*dt}')
+
+            (F_balloon_world, F_craft_world, moment_balloon, moment_craft) = LTA.update(craft, balloon, elapsed_time, t, strings, thrusters, control_values_transformed)
+  
+            # Record the positions and velocities
+            balloon_positions.append(balloon.pose_worldcoords_over_bodycoords.offset)
+            craft_positions.append(craft.pose_worldcoords_over_bodycoords.offset)
+            balloon_velocities.append(balloon.velocity_cm_worldcoords)
+            craft_velocities.append(craft.velocity_cm_worldcoords)
+            balloon_momentums.append(balloon.velocity_cm_worldcoords*balloon.mass)
+            craft_momentums.append(craft.velocity_cm_worldcoords*craft.mass)
+            change_in_momentum.append((F_craft_world + F_balloon_world)*elapsed_time)
+            balloon_ang_momentums.append(balloon.angular_momentum_worldcoords)
+            craft_ang_momentums.append(craft.angular_momentum_worldcoords)
+            
+            change_in_ang_momentums.append((moment_craft + moment_balloon)*elapsed_time)
+    
+            with recdb.start_transaction() as trans:
+                update_pose_channel(trans,world_over_craft,craft.pose_worldcoords_over_bodycoords.quat,craft.pose_worldcoords_over_bodycoords.offset,snde.recdb_path_join(craft_model_tree,"meshed"))
+                update_pose_channel(trans,world_over_balloon,balloon.pose_worldcoords_over_bodycoords.quat,balloon.pose_worldcoords_over_bodycoords.offset,snde.recdb_path_join(balloon_model_tree,"meshed"))
+                pass
+            
+            trans.globalrev_wait()
+    
+            last_time_step = current_time
+            current_time = time.time()
+            elapsed_time = (current_time - last_time_step)/slowdown_factor
+            pass
+            
+        sleep_time = dt_fixed - elapsed_time
+        if sleep_time > 0:
+            sleep(sleep_time*slowdown_factor)
+            pass
+        pass
+
+    # Plot data after done running: plot_history_now.append(True)
+    # Convert to numpy arrays for plotting
+    print("Plotting...")
+    balloon_positions = np.array(balloon_positions)
+    craft_positions = np.array(craft_positions)
+    balloon_velocities = np.array(balloon_velocities)
+    craft_velocities = np.array(craft_velocities)
+    change_in_momentums = np.array(change_in_momentum)
+    # print(f'{change_in_momentums}')
+    balloon_momentums = np.array(balloon_momentums)
+    craft_momentums = np.array(craft_momentums)
+    change_in_ang_momentums = np.array(change_in_ang_momentums)
+    balloon_ang_momentums = np.array(balloon_ang_momentums)
+    craft_ang_momentums = np.array(craft_ang_momentums)
+
+    # Plot Velocity: 
+    dynamic_plotting(time_steps,craftvals=craft_velocities,balloonvals=balloon_velocities, change_in_momentum=None,type='velocity',index=None, plot_type="3d",labels=None,colors=["red","maroon"])
+
+    # Plot Position: 
+    dynamic_plotting(time_steps, craftvals=craft_positions, balloonvals=balloon_positions, change_in_momentum=None,type='position',index=None, plot_type="3d", labels=None, colors=["red","maroon"])
+
+    # Plot Linear Momentum: 
+    dynamic_plotting(time_steps,craftvals=None,balloonvals=None,change_in_momentum=change_in_momentums,type='change_momentum',index=None, plot_type="3d", labels=None, colors=["red","maroon","blue"])
+    
+    dynamic_plotting(time_steps, craftvals=craft_momentums,balloonvals=balloon_momentums,change_in_momentum=None,type='momentum',index=None, plot_type="3d", labels=None, colors=["red","maroon","blue"])
+    
+    # Plot Angular Momentum
+    dynamic_plotting(time_steps, craftvals=craft_ang_momentums,balloonvals=balloon_ang_momentums,change_in_momentum=None,type='ang_momentum',index=None, plot_type="3d", labels=None, colors=["red","maroon","blue"])
+    
+    dynamic_plotting(time_steps,craftvals=None,balloonvals=None,change_in_momentum=change_in_ang_momentums,type='change_ang_momentum',index=None, plot_type="3d", labels=None, colors=["red","maroon","blue"])
+    
+    plt.show()
+    pass
+
+update_threading = threading.Thread(target=update_threading_code,args=(craft, balloon, strings, thrusters, recdb))
+update_threading.start()
+
+# Used when debugging in pdb (comment out when not debugging):
+# time.sleep(1000)
